@@ -64,9 +64,9 @@ selected_path = scenario_files[scenario_labels.index(selected_label)]
 # Run the scheduler
 # ---------------------------------------------------------------------------
 
-buses, stations, world, weights = load_scenario(selected_path)
-assign_all_combos(buses,stations, world, weights)  # note: corrected arg order
-run_schedule(buses, stations, world, weights)
+buses, stations, chargers, world, weights = load_scenario(selected_path)
+assign_all_combos(buses, world, stations, chargers)
+run_schedule(buses, chargers, world, weights)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ with tab1:
         st.subheader("World Config")
         world_data = {
             "speed_kmh": world.speed_kmh,
-            "battery_km": world.battery_km,
+            "battery_km": world.battery_range_km,
             "charge_time_min": world.charge_time_min,
         }
         st.table(pd.DataFrame([world_data]))
@@ -131,7 +131,7 @@ with tab1:
                 "operator": b.operator,
                 "direction": b.direction,
                 "departure": min_to_hhmm(b.departure_min),
-                "charge_at": " → ".join(b.charge_stations),
+                "charge_at": " → ".join(b.assigned_combo),
             }
             for b in buses
         ]
@@ -144,7 +144,7 @@ with tab2:
     st.subheader("Per-Bus Timetable")
     st.caption("Each row is one bus. Stop columns show arrival / wait / depart at each charging station.")
 
-    all_station_ids = [s.id for s in stations]
+    all_station_ids = list(stations.keys())
 
     rows = []
     for bus in buses:
@@ -168,7 +168,7 @@ with tab2:
                 row[f"{sid} wait"]    = "—"
                 row[f"{sid} depart"]  = "—"
 
-        row["Final arrival"] = min_to_hhmm(bus.current_time_min)
+        row["Final arrival"] = min_to_hhmm(bus.final_arrival_min or bus.current_time_min)
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -181,7 +181,7 @@ with tab3:
     st.subheader("Per-Station View")
     st.caption("Each station's charging queue, ordered by charge start time.")
 
-    for station in stations:
+    for station in stations.values():
         st.markdown(f"### Station {station.id}")
 
         # Collect all stops at this station across all buses

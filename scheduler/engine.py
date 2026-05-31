@@ -43,39 +43,55 @@ from .rules import score_bus, build_context
 # Scenario loading
 # ---------------------------------------------------------------------------
 
+def _parse_departure(dep_str: str) -> float:
+    h, m = dep_str.split(":")
+    return int(h) * 60 + int(m)
+
+
 def load_scenario(path: str):
     """
-    Read a JSON scenario file and return (buses, stations, world, weights).
-    Keeps exactly the same return signature as the original.
+    Read a JSON scenario file and return (buses, stations, chargers, world, weights).
     """
     with open(path) as f:
         data = json.load(f)
 
-    segments = [Segment(**s) for s in data["segments"]]
+    world_data = data["world"]
+    raw_segments = world_data["segments"]
+    segments = [
+        Segment(from_stop=s["from"], to_stop=s["to"], distance_km=s["distance_km"])
+        for s in raw_segments
+    ]
 
-    # Build a distance map: {station_id: km_from_bengaluru}
-    station_distances = {}
+    station_ids = [s["id"] for s in data["stations"]]
+    station_distances: dict = {}
     cumulative = 0.0
     for seg in segments:
         cumulative += seg.distance_km
-        if seg.to_id in [s["id"] for s in data["stations"]]:
-            station_distances[seg.to_id] = cumulative
+        if seg.to_stop in station_ids:
+            station_distances[seg.to_stop] = cumulative
 
     world = World(
         segments=segments,
-        speed_kmh=data.get("speed_kmh", 60),
-        charge_time_min=data.get("charge_time_min", 25),
-        battery_range_km=data.get("battery_range_km", 240),
-        total_route_km=sum(s["distance_km"] for s in data["segments"]),
-        station_order=[s["id"] for s in data["stations"]],
+        speed_kmh=world_data.get("speed_kmh", 60),
+        charge_time_min=world_data.get("charge_time_min", 25),
+        battery_range_km=world_data.get("battery_km", 240),
+        total_route_km=sum(s["distance_km"] for s in raw_segments),
+        station_order=station_ids,
         station_distances=station_distances,
     )
 
     stations = {s["id"]: StationConfig(**s) for s in data["stations"]}
-    chargers = {sid: Charger(station_id=sid, free_at_min=0)
-                for sid in stations}
+    chargers = {
+        sid: [Charger(station_id=sid, charger_index=i, free_at_min=0.0)
+              for i in range(stations[sid].charger_count)]
+        for sid in stations
+    }
     weights = Weights(**data["weights"])
-    buses = [Bus(**b) for b in data["buses"]]
+    buses = []
+    for b in data["buses"]:
+        b = dict(b)
+        b["departure_min"] = _parse_departure(b.pop("departure"))
+        buses.append(Bus(**b))
 
     return buses, stations, chargers, world, weights
 
@@ -101,7 +117,7 @@ def _travel_min(from_id: str, to_id: str, direction: str, world: World) -> float
 # Event-driven scheduler
 # ---------------------------------------------------------------------------
 
-def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
+def run_schedule(buses: List[Bus], chargers: Dict[str, List[Charger]],
                  world: World, weights: Weights) -> None:
     """
     Event-driven simulation.  Modifies buses in place (charge_stops,
@@ -141,8 +157,9 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
         bus._range_remaining_km = world.battery_range_km
 
     # Reset chargers
-    for c in chargers.values():
-        c.free_at_min = 0
+    for charger_list in chargers.values():
+        for c in charger_list:
+            c.free_at_min = 0
 
     # Per-station queue of (score, arrival_time, bus_id, combo_idx)
     # Buses sitting here have arrived but the charger was busy.
@@ -178,7 +195,7 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
     def start_charging(bus: Bus, station_id: str, arrival_time: float,
                        combo_idx: int) -> None:
         """Commit bus to charge at station_id starting now (charger is free)."""
-        charger = chargers[station_id]
+        charger = min(chargers[station_id], key=lambda c: c.free_at_min)
         slot_time = max(charger.free_at_min, arrival_time)
         wait_min = max(0.0, slot_time - arrival_time)
         depart_time = slot_time + world.charge_time_min
@@ -187,7 +204,7 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
             station_id=station_id,
             arrival_min=arrival_time,
             charge_start_min=slot_time,
-            depart_min=depart_time,
+            charge_end_min=depart_time,
             wait_min=wait_min,
         ))
         charger.free_at_min = depart_time
@@ -214,33 +231,27 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
     def drain_waiting(station_id: str) -> None:
         """
         After a charger becomes free, pick the best waiter by score and
-        start charging.  Score is recomputed at this moment so that
-        operator fairness and accumulated waits are current.
+        start charging.  Loops to fill all currently free charger slots
+        (supports charger_count > 1).
         """
-        wq = waiting[station_id]
-        if not wq:
-            return
-        charger = chargers[station_id]
-        if charger.free_at_min > _current_time:
-            # Charger still busy — don't drain yet (will be triggered on
-            # next event that finishes charging here, or by the event loop).
-            return
-
-        # Recompute scores for all waiters with current context
         context = build_context(list(bus_map.values()), station_id)
-        scored = []
-        for (arr_time, bid, cidx) in wq:
-            b = bus_map[bid]
-            effective_slot = max(charger.free_at_min, arr_time)
-            sc = score_bus(b, effective_slot, context, weights)
-            scored.append((sc, arr_time, bid, cidx))
+        while waiting[station_id]:
+            free_charger = min(chargers[station_id], key=lambda c: c.free_at_min)
+            if free_charger.free_at_min > _current_time:
+                return
 
-        scored.sort(key=lambda x: (x[0], x[1]))  # score first, FCFS tiebreak
-        best = scored.pop(0)
-        waiting[station_id] = [(a, bi, ci) for (_, a, bi, ci) in scored]
+            scored = []
+            for (arr_time, bid, cidx) in waiting[station_id]:
+                b = bus_map[bid]
+                effective_slot = max(free_charger.free_at_min, arr_time)
+                sc = score_bus(b, effective_slot, context, weights)
+                scored.append((sc, arr_time, bid, cidx))
 
-        _, arr_time, bid, cidx = best
-        start_charging(bus_map[bid], station_id, arr_time, cidx)
+            scored.sort(key=lambda x: (x[0], x[1]))
+            best = scored.pop(0)
+            waiting[station_id] = [(a, bi, ci) for (_, a, bi, ci) in scored]
+            _, arr_time, bid, cidx = best
+            start_charging(bus_map[bid], station_id, arr_time, cidx)
 
     _current_time = 0.0
 
@@ -250,26 +261,23 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
 
         _current_time = arrival_time
         bus = bus_map[bus_id]
-        charger = chargers[station_id]
 
-        if charger.free_at_min <= arrival_time:
-            # Charger is free — start immediately (scores all waiters first)
-            # First drain any existing waiters for this station
+        def _min_free(sid: str) -> float:
+            return min(c.free_at_min for c in chargers[sid])
+
+        if _min_free(station_id) <= arrival_time:
+            # At least one charger is free — drain waiters first, then take a slot
             drain_waiting(station_id)
-            # If no waiters, or after draining the charger is still free, go
-            if charger.free_at_min <= arrival_time:
+            if _min_free(station_id) <= arrival_time:
                 start_charging(bus, station_id, arrival_time, combo_idx)
             else:
-                # A waiter just grabbed the slot; this bus must wait
                 waiting[station_id].append((arrival_time, bus_id, combo_idx))
         else:
-            # Charger busy — join the waiting list
             waiting[station_id].append((arrival_time, bus_id, combo_idx))
 
-        # After processing this event, try to drain stations whose charger
-        # has just become free (i.e. whose free_at_min <= current time).
+        # Try to drain other stations that may have freed up a charger slot.
         for sid, wq in waiting.items():
-            if wq and chargers[sid].free_at_min <= _current_time:
+            if wq and _min_free(sid) <= _current_time:
                 drain_waiting(sid)
 
     # ── Flush any remaining waiters ─────────────────────────────────────────
@@ -285,7 +293,7 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
             if not wq:
                 continue
             pending = True
-            charger = chargers[station_id]
+            charger = min(chargers[station_id], key=lambda c: c.free_at_min)
             context = build_context(list(bus_map.values()), station_id)
             scored = []
             for (arr_time, bid, cidx) in wq:
@@ -308,7 +316,7 @@ def run_schedule(buses: List[Bus], chargers: Dict[str, Charger],
             last = bus.charge_stops[-1]
             last_dist = dist_map[last.station_id]
             dist_remaining = world.total_route_km - last_dist
-            bus.final_arrival_min = (last.depart_min
+            bus.final_arrival_min = (last.charge_end_min
                                      + dist_remaining / world.speed_kmh * 60)
         else:
             bus.final_arrival_min = (bus.departure_min

@@ -87,17 +87,22 @@ def wait_penalty(bus: Bus, slot_time: float, context: dict) -> float:
 @rule("operator")
 def operator_fairness_penalty(bus: Bus, slot_time: float, context: dict) -> float:
     """
-    If this operator's fleet already has a HIGH average wait,
-    giving this bus yet another long wait makes it worse.
-    
-    We return the operator's current average wait as extra cost,
-    so the engine is nudged toward reducing wait for overloaded operators.
-    
-    When operator weight = 2.0 (Scenario 4), this rule's influence doubles,
-    visibly shifting the schedule to protect KPN buses.
+    Equity signal: return (this operator's avg wait) minus (network avg wait).
+
+    Positive  → operator is doing better than average → slight deprioritisation.
+    Negative  → operator is doing worse than average  → priority boost.
+
+    This means buses from the most-delayed fleet are served first, which
+    actively equalises wait times across operators.  When operator weight = 2.0
+    (Scenario 4) the equity effect doubles, visibly shifting slot order when
+    buses from different operators compete at the same station.
     """
     avg_waits = context.get("operator_avg_wait", {})
-    return avg_waits.get(bus.operator, 0.0)
+    if not avg_waits:
+        return 0.0
+    network_avg = sum(avg_waits.values()) / len(avg_waits)
+    op_avg = avg_waits.get(bus.operator, network_avg)
+    return op_avg - network_avg
 
 
 @rule("overall")
