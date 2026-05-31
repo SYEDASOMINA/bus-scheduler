@@ -110,37 +110,59 @@ def assign_all_combos(buses, world, stations: Dict, chargers: Dict) -> None:
     """
     Assign a charging combo to every bus in departure-time order.
 
-    Primary sort key: lowest total projected load across the combo's stations.
-    Tiebreak: fewest times this combo has already been assigned (round-robin
-    among equal-load combos).  Without the tiebreak, Python's min() always
-    returns the first equal item, so all buses collapse onto one combo even
-    when alternatives exist.
+    Cost: timing-aware estimated total wait across all stops in the combo.
+    For each stop:
+        arrival  = departure_min + cumulative travel time (accounting for
+                   charge durations at prior stops in the same combo)
+        est_wait = max(0, dir_free[direction][sid] - arrival)
+
+    dir_free tracks tentative charger availability *per direction* so that
+    BK buses aren't misled by KB buses booking a slot they'd arrive at
+    much later (and vice versa).  Cross-direction competition is handled by
+    run_schedule which processes events in true arrival-time order.
+
+    Primary sort key: fewest stops (each extra stop = 25 min of charging).
+    Secondary: lowest estimated wait. Tertiary: round-robin tiebreak.
     """
     sorted_buses = sorted(buses, key=lambda b: b.departure_min)
     combo_count: Dict[tuple, int] = defaultdict(int)
 
+    # Per-direction tentative station free times (station_id -> float)
+    dir_free: Dict[str, Dict[str, float]] = {
+        "BK": {sid: 0.0 for sid in chargers},
+        "KB": {sid: 0.0 for sid in chargers},
+    }
+
     for bus in sorted_buses:
         valid = get_valid_combos(bus.direction, world, stations)
+        dist_map = build_distance_map_simple(bus.direction, world)
+        free = dir_free[bus.direction]
 
         def combo_key(combo: List[str]) -> tuple:
-            load = sum(
-                min(c.free_at_min for c in chargers[sid]) if sid in chargers else 0.0
-                for sid in combo
-            )
-            return (load, combo_count[tuple(combo)])
+            total_wait = 0.0
+            current_time = bus.departure_min
+            for i, sid in enumerate(combo):
+                seg_km = dist_map[sid] if i == 0 else dist_map[sid] - dist_map[combo[i - 1]]
+                arrival = current_time + seg_km / world.speed_kmh * 60
+                wait = max(0.0, free[sid] - arrival) if sid in free else 0.0
+                total_wait += wait
+                current_time = arrival + wait + world.charge_time_min
+            return (len(combo), total_wait, combo_count[tuple(combo)])
 
         chosen = min(valid, key=combo_key) if valid else []
         bus.assigned_combo = chosen
         combo_count[tuple(chosen)] += 1
 
-        # Tentatively increment the earliest-free charger so subsequent buses
-        # see this station as more loaded.
-        for sid in bus.assigned_combo:
-            if sid in chargers:
-                earliest = min(chargers[sid], key=lambda c: c.free_at_min)
-                earliest.free_at_min += world.charge_time_min
+        # Commit predicted slot times into this direction's free map.
+        current_time = bus.departure_min
+        for i, sid in enumerate(chosen):
+            seg_km = dist_map[sid] if i == 0 else dist_map[sid] - dist_map[chosen[i - 1]]
+            arrival = current_time + seg_km / world.speed_kmh * 60
+            slot_time = max(free.get(sid, 0.0), arrival)
+            free[sid] = slot_time + world.charge_time_min
+            current_time = free[sid]
 
-    # Reset after assignment — actual scheduling starts from 0
+    # Reset actual charger objects — run_schedule starts from scratch.
     for charger_list in chargers.values():
         for c in charger_list:
             c.free_at_min = 0
